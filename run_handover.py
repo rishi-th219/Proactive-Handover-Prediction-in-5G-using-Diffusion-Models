@@ -1,102 +1,115 @@
+"""
+run_handover.py
+===============
+Real-time handover decision system.
+Generates N probabilistic futures and outputs a risk-based decision.
+
+Change MODEL_TYPE below to switch between models:
+    "ddpm"      — standard parallel diffusion (100 steps)
+    "ddim"      — fast parallel diffusion (50 steps, same DDPM weights)
+    "timegrad"  — autoregressive diffusion (requires separate training)
+"""
+
 import torch
 import numpy as np
 import pandas as pd
+
 from diffusion_model import RSRPDiffusion
-from dataset_loader import RSRPDataset, DataLoader
+from timegrad_model  import TimeGradModel
+from dataset_loader  import RSRPDataset, DataLoader
+from ddim_sampler    import (build_noise_schedule, ddpm_sample,
+                              ddim_sample, timegrad_sample, denorm)
 
-# --- CONFIGURATION ---
-MODEL_PATH = "diffusion_handover_model.pth"
-DATA_DIR = "data/"  # Folder where your CSVs are
-TIMESTEPS = 100
-THRESHOLD_DBM = -110  # Real world threshold for handover
-# Note: We need the min/max from training to convert back to dBm.
-# Based on typical RSRP values, let's estimate or recalculate them.
-# Ideally, save these during training, but recalculating here works for a demo.
-df = pd.read_csv(DATA_DIR + 'drive_test_measurements01.csv')
-RSRP_MIN = df['RSRP'].min()
-RSRP_MAX = df['RSRP'].max()
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG — change MODEL_TYPE to switch models
+# ─────────────────────────────────────────────────────────────────────────────
+MODEL_TYPE    = "ddpm"      # "ddpm" | "ddim" | "timegrad"
+PRED_LEN      = 10
+THRESHOLD_DBM = -110
+N_SAMPLES     = 50
+DATA_DIR      = "data/"
+DDIM_STEPS    = 50
 
-# --- SETUP ---
+CHECKPOINTS = {
+    "ddpm"     : "diffusion_handover_model.pth",
+    "ddim"     : "diffusion_handover_model.pth",   # same weights as ddpm
+    "timegrad" : "models/timegrad_pred10_model.pth",
+}
+# ─────────────────────────────────────────────────────────────────────────────
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load Model
-model = RSRPDiffusion().to(device)
-model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+# ── Normalisation stats ───────────────────────────────────────────────────────
+df_ref   = pd.read_csv(f"{DATA_DIR}drive_test_measurements01.csv")
+RSRP_MIN = float(df_ref["RSRP"].min())
+RSRP_MAX = float(df_ref["RSRP"].max())
+
+# ── Load model ────────────────────────────────────────────────────────────────
+ckpt_path = CHECKPOINTS[MODEL_TYPE]
+if MODEL_TYPE == "timegrad":
+    model = TimeGradModel().to(device)
+else:
+    model = RSRPDiffusion().to(device)
+
+model.load_state_dict(torch.load(ckpt_path, map_location=device))
 model.eval()
-print("Model Loaded Successfully.")
+print(f"Model     : {MODEL_TYPE.upper()}")
+print(f"Checkpoint: {ckpt_path}")
 
-# Load Data (We just grab one sequence to test)
-dataset = RSRPDataset(data_dir=DATA_DIR)
-loader = DataLoader(dataset, batch_size=1, shuffle=False)
+# ── Load test sequence ────────────────────────────────────────────────────────
+dataset  = RSRPDataset(data_dir=DATA_DIR, pred_len=PRED_LEN)
+loader   = DataLoader(dataset, batch_size=1, shuffle=False)
 
-# Get the first batch of history (Real usage would be live data)
-# Skip first 500 samples to find a bad signal area
+# Skip 500 samples to reach a more interesting signal region
 iterator = iter(loader)
-for _ in range(500): 
+for _ in range(500):
     history, _ = next(iterator)
 history = history.to(device)
 
-# --- GENERATION (Phase 3) ---
-print(f"Simulating future for current signal: {history[0, -1, 0].item() * (RSRP_MAX - RSRP_MIN)/2 + (RSRP_MAX + RSRP_MIN)/2:.2f} dBm")
-print("Generating 50 probabilistic future scenarios...")
+# Current signal in dBm
+current_norm = history[0, -1, 0].item()
+current_dbm  = denorm(current_norm, RSRP_MIN, RSRP_MAX)
+print(f"\nCurrent RSRP: {current_dbm:.2f} dBm")
+print(f"Generating {N_SAMPLES} probabilistic futures ({PRED_LEN} ms ahead)...")
 
-# Define diffusion schedule (Must match training!)
-betas = torch.linspace(1e-4, 0.02, TIMESTEPS).to(device)
-alphas = 1. - betas
-alphas_cumprod = torch.cumprod(alphas, axis=0)
+# ── Generate futures ──────────────────────────────────────────────────────────
+betas, alphas, alphas_cumprod = build_noise_schedule(device)
 
 with torch.no_grad():
-    n_samples = 50
-    # Replicate the single history 50 times
-    history_expanded = history.repeat(n_samples, 1, 1)
-    
-    # Start with pure noise
-    x = torch.randn(n_samples, 10, 1).to(device) # 10 steps into the future
-    
-    # Reverse Diffusion (Denoising)
-    for t in reversed(range(TIMESTEPS)):
-        t_tensor = torch.full((n_samples,), t, device=device)
-        pred_noise = model(x, t_tensor, history_expanded)
-        
-        alpha = alphas[t]
-        alpha_bar = alphas_cumprod[t]
-        beta = betas[t]
-        
-        if t > 0:
-            noise = torch.randn_like(x)
-        else:
-            noise = 0
-            
-        x = (1 / torch.sqrt(alpha)) * (x - ((1 - alpha) / (torch.sqrt(1 - alpha_bar))) * pred_noise) + torch.sqrt(beta) * noise
+    if MODEL_TYPE == "ddim":
+        x, elapsed = ddim_sample(model, history, N_SAMPLES, PRED_LEN,
+                                  alphas_cumprod, ddim_steps=DDIM_STEPS,
+                                  eta=0.0, device=device)
+    elif MODEL_TYPE == "timegrad":
+        x, elapsed = timegrad_sample(model, history, N_SAMPLES, PRED_LEN,
+                                      betas, alphas, alphas_cumprod, device)
+    else:   # ddpm
+        x, elapsed = ddpm_sample(model, history, N_SAMPLES, PRED_LEN,
+                                  betas, alphas, alphas_cumprod, device)
 
-# --- DECISION (Phase 4) ---
-# Convert normalized [-1, 1] output back to real dBm values
-# Formula: x_norm = (x_real - min) / (max - min) * 2 - 1
-# Reverse: x_real = ((x_norm + 1) / 2) * (max - min) + min
-future_dbm = ((x.cpu().numpy() + 1) / 2) * (RSRP_MAX - RSRP_MIN) + RSRP_MIN
+future_dbm = denorm(x.cpu().numpy().squeeze(-1), RSRP_MIN, RSRP_MAX)  # (N_SAMPLES, PRED_LEN)
 
-# Calculate Risk
-drops = 0
-risk_threshold = THRESHOLD_DBM 
+# ── Risk assessment ───────────────────────────────────────────────────────────
+drops         = np.sum(np.min(future_dbm, axis=1) < THRESHOLD_DBM)
+prob_failure  = drops / N_SAMPLES
+min_predicted = np.min(future_dbm)
+mean_future   = np.mean(future_dbm)
 
-for i in range(n_samples):
-    # Check if ANY point in the future path drops below threshold
-    if np.min(future_dbm[i]) < risk_threshold:
-        drops += 1
+print(f"\nInference time : {elapsed:.4f}s")
+print(f"Min predicted  : {min_predicted:.2f} dBm")
+print(f"Mean predicted : {mean_future:.2f} dBm")
+print(f"Risk (P < {THRESHOLD_DBM} dBm): {prob_failure * 100:.1f}%")
 
-prob_failure = drops / n_samples
-print("-" * 30)
-print(f"Analysis of 50 generated futures:")
-print(f"Probability of dropping below {risk_threshold} dBm: {prob_failure * 100:.1f}%")
-
-print("\n--- FINAL DECISION ---")
+print("\n" + "─" * 35)
+print("HANDOVER DECISION")
+print("─" * 35)
 if prob_failure > 0.8:
-    print("🔴 ACTION: TRIGGER HANDOVER IMMEDIATELY")
-    print("Reason: High certainty of signal failure.")
+    print("🔴  TRIGGER HANDOVER IMMEDIATELY")
+    print("    Reason: >80% of futures predict signal failure.")
 elif prob_failure > 0.4:
-    print("🟡 ACTION: PREPARE HANDOVER (Measurement Gap)")
-    print("Reason: Signal is unstable, monitor closely.")
+    print("🟡  PREPARE HANDOVER (Measurement Gap)")
+    print("    Reason: Signal unstable — moderate failure risk.")
 else:
-    print("🟢 ACTION: STAY CONNECTED")
-    print("Reason: Signal is predicted to remain stable.")
-print("-" * 30)
+    print("🟢  STAY CONNECTED")
+    print("    Reason: Signal predicted to remain stable.")
+print("─" * 35)

@@ -8,9 +8,9 @@ class RSRPDataset(Dataset):
     def __init__(self, data_dir='data/', seq_len=50, pred_len=10):
         # This will load and combine all three CSV files
         csv_files = [
-            'drive_test_measurements01.csv',
-            'drive_test_measurements02.csv',
-            'drive_test_measurements03.csv'
+            'drive_test_measurements01.csv'
+            # 'drive_test_measurements02.csv',
+            # 'drive_test_measurements03.csv'
         ]
         
         data_list = []

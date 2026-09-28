@@ -1,8 +1,12 @@
+import os
+import json
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from dataset_loader import RSRPDataset, DataLoader
 from diffusion_model import RSRPDiffusion
+
 
 TIMESTEPS = 100
 BETA_START = 1e-4
